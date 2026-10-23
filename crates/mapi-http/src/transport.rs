@@ -3,12 +3,7 @@
 
 //! Blocking HTTPS transport for the MAPI/HTTP EMSMDB endpoint.
 
-use std::collections::BTreeMap;
-use std::io::Read;
-use std::sync::Arc;
 use std::time::Duration;
-
-use base64::Engine;
 
 use crate::emsmdb::{Framed, parse_framed};
 use crate::error::{Error, Result};
@@ -16,7 +11,7 @@ use crate::error::{Error, Result};
 /// Connection settings. Usually built with [`Config::from_env`].
 #[derive(Clone)]
 pub struct Config {
-    /// Full EMSMDB URL, e.g. `https://host/mapi/emsmdb/?MailboxId=<guid>@<domain>`.
+    /// Full EMSMDB URL, e.g. `https://<server>/mapi/emsmdb/?MailboxId=<mailbox-guid>@<domain>`.
     pub url: String,
     pub user: String,
     pub password: String,
@@ -44,6 +39,11 @@ impl std::fmt::Debug for Config {
 impl Config {
     /// Reads `MAPI_HTTP_MAPI_URL`, `MAPI_HTTP_USER`, `MAPI_HTTP_PASSWORD`, `MAPI_HTTP_USER_DN`,
     /// optional `MAPI_HTTP_CLIENT_APPLICATION` and `MAPI_HTTP_INSECURE_TLS=1`.
+    ///
+    /// Exchange checks `X-ClientApplication` (MS-OXCMAPIHTTP 2.2.3.1.4): it must be
+    /// `Name/major.minor.build.revision` with a version the server accepts. Otherwise Connect fails
+    /// with `MissingHeader`, `MAPI_E_VERSION` or `ecClientVerDisallowed`. Set
+    /// `MAPI_HTTP_CLIENT_APPLICATION` for real servers; the default is only a placeholder.
     pub fn from_env() -> Result<Self> {
         let var = |name: &str| {
             std::env::var(name)
@@ -66,40 +66,26 @@ impl Config {
 }
 
 pub struct Transport {
-    agent: ureq::Agent,
+    client: reqwest::blocking::Client,
     config: Config,
-    authorization: String,
     client_info: String,
     request_counter: u32,
-    cookies: BTreeMap<String, String>,
 }
 
 impl Transport {
     pub fn new(config: Config) -> Result<Self> {
-        let mut builder = ureq::AgentBuilder::new()
+        let client = reqwest::blocking::Client::builder()
             .timeout(config.timeout)
-            .redirects(0);
-        if config.insecure_tls {
-            let connector = native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()
-                .map_err(|e| Error::Http(e.to_string()))?;
-            builder = builder.tls_connector(Arc::new(connector));
-        } else {
-            let connector =
-                native_tls::TlsConnector::new().map_err(|e| Error::Http(e.to_string()))?;
-            builder = builder.tls_connector(Arc::new(connector));
-        }
-        let credentials = base64::engine::general_purpose::STANDARD
-            .encode(format!("{}:{}", config.user, config.password));
+            .redirect(reqwest::redirect::Policy::none())
+            .cookie_store(true)
+            .danger_accept_invalid_certs(config.insecure_tls)
+            .build()
+            .map_err(http_error)?;
         Ok(Self {
-            agent: builder.build(),
-            authorization: format!("Basic {credentials}"),
+            client,
             client_info: format!("{{{}}}", new_guid()),
             config,
             request_counter: 0,
-            cookies: BTreeMap::new(),
         })
     }
 
@@ -111,58 +97,38 @@ impl Transport {
     pub fn post(&mut self, request_type: &'static str, body: &[u8]) -> Result<Framed> {
         self.request_counter += 1;
         let request_id = format!("{}:{}", self.client_info, self.request_counter);
-        let mut request = self
-            .agent
+        let request = self
+            .client
             .post(&self.config.url)
-            .set("Authorization", &self.authorization)
-            .set("Content-Type", "application/mapi-http")
-            .set("Accept", "application/mapi-http")
-            .set("X-RequestType", request_type)
-            .set("X-ClientInfo", &format!("{}:1", self.client_info))
-            .set("X-RequestId", &request_id)
-            .set("X-ClientApplication", &self.config.client_application);
-        if !self.cookies.is_empty() {
-            let cookie = self
-                .cookies
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            request = request.set("Cookie", &cookie);
-        }
+            .basic_auth(&self.config.user, Some(&self.config.password))
+            .header("Content-Type", "application/mapi-http")
+            .header("Accept", "application/mapi-http")
+            .header("X-RequestType", request_type)
+            .header("X-ClientInfo", format!("{}:1", self.client_info))
+            .header("X-RequestId", request_id)
+            .header("X-ClientApplication", &self.config.client_application);
 
-        let response = match request.send_bytes(body) {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                return Err(Error::HttpStatus {
-                    status,
-                    request_type,
-                    response_code: response
-                        .header("X-ResponseCode")
-                        .and_then(|v| v.trim().parse().ok()),
-                    authenticate: response.header("WWW-Authenticate").map(str::to_string),
-                });
-            }
-            Err(e) => return Err(Error::Http(e.to_string())),
+        let response = request.body(body.to_vec()).send().map_err(http_error)?;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
         };
-
-        for set_cookie in response.all("Set-Cookie") {
-            if let Some((name, value)) = set_cookie
-                .split(';')
-                .next()
-                .and_then(|pair| pair.split_once('='))
-            {
-                self.cookies
-                    .insert(name.trim().to_string(), value.trim().to_string());
-            }
+        let header_code = header("X-ResponseCode").and_then(|v| v.trim().parse::<u32>().ok());
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::HttpStatus {
+                status: status.as_u16(),
+                request_type,
+                response_code: header_code,
+                authenticate: header("WWW-Authenticate"),
+            });
         }
 
-        let header_code = response
-            .header("X-ResponseCode")
-            .and_then(|v| v.trim().parse::<u32>().ok());
-        let description = response.header("X-FailureDescription").map(str::to_string);
-        let mut bytes = Vec::new();
-        response.into_reader().read_to_end(&mut bytes)?;
+        let description = header("X-FailureDescription");
+        let bytes = response.bytes().map_err(http_error)?;
         if let Some(code) = header_code.filter(|c| *c != 0) {
             return Err(Error::ResponseCode {
                 request_type,
@@ -175,10 +141,10 @@ impl Transport {
         framed.check(request_type)?;
         Ok(framed)
     }
+}
 
-    pub fn clear_cookies(&mut self) {
-        self.cookies.clear();
-    }
+fn http_error(e: reqwest::Error) -> Error {
+    Error::Http(e.to_string())
 }
 
 /// Random version-4 GUID string without braces (no extra crate dependency).
@@ -238,5 +204,120 @@ mod tests {
             timeout: Duration::from_secs(1),
         };
         assert!(!format!("{config:?}").contains("secret"));
+    }
+
+    fn local_config(url: String) -> Config {
+        Config {
+            url,
+            user: "u".into(),
+            password: "p".into(),
+            user_dn: String::new(),
+            client_application: "test/1".into(),
+            insecure_tls: false,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Serves canned HTTP responses on a loopback port and returns each raw request.
+    fn serve(responses: Vec<Vec<u8>>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mapi/emsmdb/", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    data.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&data).to_string());
+                stream.write_all(&response).unwrap();
+            }
+            requests
+        });
+        (url, handle)
+    }
+
+    fn reply(status: &str, headers: &[&str], body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for h in headers {
+            out.push_str(h);
+            out.push_str("\r\n");
+        }
+        out.push_str("\r\n");
+        let mut out = out.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn post_sends_headers_and_keeps_cookies() {
+        let mut ok = b"PROCESSING\r\nDONE\r\nX-ElapsedTime: 1\r\n\r\n".to_vec();
+        ok.extend_from_slice(&[0u8; 8]);
+        ok.push(0xAB);
+        let (url, server) = serve(vec![
+            reply(
+                "200 OK",
+                &["X-ResponseCode: 0", "Set-Cookie: sid=abc; path=/"],
+                &ok,
+            ),
+            reply("200 OK", &["X-ResponseCode: 0"], &ok),
+        ]);
+        let mut transport = Transport::new(local_config(url)).unwrap();
+        let framed = transport.post("Connect", b"hello").unwrap();
+        assert_eq!(framed.body.last(), Some(&0xAB));
+        transport.post("Execute", b"again").unwrap();
+        let requests = server.join().unwrap();
+        let first = requests[0].to_ascii_lowercase();
+        assert!(first.starts_with("post /mapi/emsmdb/ "));
+        assert!(first.contains("x-requesttype: connect"));
+        assert!(first.contains("content-type: application/mapi-http"));
+        assert!(first.contains("x-clientapplication: test/1"));
+        assert!(first.contains("authorization: basic dtpw"));
+        assert!(first.ends_with("hello"));
+        assert!(!first.contains("cookie: sid"));
+        assert!(requests[1].to_ascii_lowercase().contains("cookie: sid=abc"));
+    }
+
+    #[test]
+    fn post_maps_http_status_and_response_code() {
+        let (url, server) = serve(vec![
+            reply("401 Unauthorized", &["WWW-Authenticate: Basic"], b""),
+            reply("200 OK", &["X-ResponseCode: 10"], b""),
+        ]);
+        let mut transport = Transport::new(local_config(url)).unwrap();
+        match transport.post("Connect", b"") {
+            Err(Error::HttpStatus {
+                status: 401,
+                authenticate: Some(a),
+                ..
+            }) => assert_eq!(a, "Basic"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match transport.post("Connect", b"") {
+            Err(Error::ResponseCode { code: 10, .. }) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        server.join().unwrap();
     }
 }

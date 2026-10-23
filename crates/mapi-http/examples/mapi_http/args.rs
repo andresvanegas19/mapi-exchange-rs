@@ -10,7 +10,8 @@ pub const USAGE: &str = "usage: mapi_http_search_folders --blob | --probe | --li
 --probe  connect, log on, and disconnect
 --list   list search folders and their SFInfo definitions (read-only)
 Environment: MAPI_HTTP_MAPI_URL, MAPI_HTTP_USER, MAPI_HTTP_PASSWORD, MAPI_HTTP_USER_DN;
-             optional MAPI_HTTP_CLIENT_APPLICATION and MAPI_HTTP_INSECURE_TLS=1 (test boxes only).";
+             optional MAPI_HTTP_CLIENT_APPLICATION and MAPI_HTTP_INSECURE_TLS=1 (test boxes only).
+Exchange rejects Connect unless MAPI_HTTP_CLIENT_APPLICATION is Name/a.b.c.d with an accepted version.";
 
 #[derive(Debug, PartialEq)]
 pub enum Command {

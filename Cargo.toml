@@ -3,7 +3,7 @@ members = [
     "crates/update-bindings",
     "crates/mapi-stub",
     "crates/mapi-sys",
-    "crates/mapi",
+    "crates/mapi", "crates/mapi-http",
 ]
 resolver = "3"
 
